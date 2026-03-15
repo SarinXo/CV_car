@@ -1,0 +1,58 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'org.springframework.boot' version '4.0.2'
+    id 'org.openjfx.javafxplugin' version '0.1.0'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'sarinxo.edu'
+version = '0.0.1-SNAPSHOT'
+description = 'CVproject'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+}
+
+javafx {
+    version = "21"
+    modules = [ 'javafx.controls', 'javafx.fxml', 'javafx.media' ]
+}
+
+bootRun {
+    doFirst {
+        jvmArgs = [
+                "--module-path", javaFxPath,
+                "--add-modules", "javafx.controls,javafx.fxml,javafx.media"
+        ]
+    }
+}
+repositories {
+    mavenCentral()
+    mavenLocal()
+    maven {
+        url "https://mvnrepository.com/artifact/clojure-interop/java.awt"
+    }
+}
+
+configurations.all {
+    resolutionStrategy.capabilitiesResolution.withCapability("com.google.collections:google-collections") {
+        select("com.google.guava:guava:33.3.1-jre")
+    }
+}
+
+dependencies {
+    implementation "org.openpnp:opencv:${openpnpVersion}"
+    implementation 'org.springframework.boot:spring-boot-starter'
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+}
