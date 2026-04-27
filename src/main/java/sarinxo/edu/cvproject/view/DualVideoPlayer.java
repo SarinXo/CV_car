@@ -33,12 +33,12 @@ import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 import sarinxo.edu.cvproject.LaneDetector;
+import sarinxo.edu.cvproject.LaneDetector2;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Executors;
 
 
 public class DualVideoPlayer {
@@ -216,11 +216,11 @@ public class DualVideoPlayer {
 
         Mat frame = new Mat();
         List<Image> processedFrames = new ArrayList<>();
-        LaneDetector detector = new LaneDetector();
+        LaneDetector2 detector = new LaneDetector2();
         while (capture.read(frame)) {
             if (frame.empty()) continue;
 
-            Mat processed = detector.detectLaneMarkingFinal(frame);//тут вся магия
+            Mat processed = detector.detectLanes(frame);//тута
             Image fxImage = matToImage(processed);
             processedFrames.add(fxImage);
         }
