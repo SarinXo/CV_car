@@ -34,6 +34,8 @@ import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 import sarinxo.edu.cvproject.LaneDetector;
 import sarinxo.edu.cvproject.LaneDetector2;
+import sarinxo.edu.cvproject.detection.LaneDetector3;
+import sarinxo.edu.cvproject.detection.PerspectiveInitializer;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -216,11 +218,14 @@ public class DualVideoPlayer {
 
         Mat frame = new Mat();
         List<Image> processedFrames = new ArrayList<>();
-        LaneDetector2 detector = new LaneDetector2();
+        LaneDetector3 detector = null;
         while (capture.read(frame)) {
             if (frame.empty()) continue;
-
-            Mat processed = detector.detectLanes(frame);//тута
+            if (detector == null) {
+                PerspectiveInitializer.Result initialize = new PerspectiveInitializer().initialize(frame);
+                detector = new LaneDetector3(initialize.src, initialize.dst);
+            }
+            Mat processed = detector.processFrame(frame);//тута
             Image fxImage = matToImage(processed);
             processedFrames.add(fxImage);
         }

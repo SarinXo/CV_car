@@ -48,14 +48,10 @@ public class LaneDetector2 {
         int width = frame.cols();
         int height = frame.rows();
 
-        // =====================================================
         // 1. CLAHE
-        // =====================================================
         Mat enhanced = applyCLAHE(frame);
 
-        // =====================================================
         // 2. HSV
-        // =====================================================
         Mat hsv = new Mat();
         Imgproc.cvtColor(enhanced, hsv, Imgproc.COLOR_BGR2HSV);
 
@@ -68,9 +64,7 @@ public class LaneDetector2 {
         Mat colorMask = new Mat();
         Core.bitwise_or(whiteMask, yellowMask, colorMask);
 
-        // =====================================================
         // 3. Морфология (сильнее фильтрация)
-        // =====================================================
         Mat kernel = Imgproc.getStructuringElement(
                 Imgproc.MORPH_RECT,
                 new Size(5, 5)
@@ -90,24 +84,18 @@ public class LaneDetector2 {
                 kernel
         );
 
-        // =====================================================
         // 4. ROI нижняя половина
-        // =====================================================
         Rect roiRect = new Rect(0, height / 2, width, height / 2);
         Mat roi = new Mat(colorMask, roiRect);
 
-        // =====================================================
         // 5. Blur + Canny (ниже чувствительность)
-        // =====================================================
         Mat blurred = new Mat();
         Imgproc.GaussianBlur(roi, blurred, new Size(7, 7), 0);
 
         Mat edges = new Mat();
         Imgproc.Canny(blurred, edges, 70, 180);
 
-        // =====================================================
         // 6. Hough (ниже чувствительность)
-        // =====================================================
         Mat lines = new Mat();
 
         Imgproc.HoughLinesP(
@@ -142,7 +130,6 @@ public class LaneDetector2 {
 
             double slope = dy / dx;
 
-            // меньше ложных срабатываний
             if (Math.abs(slope) < 0.55) continue;
 
             double length = Math.sqrt(dx * dx + dy * dy);
@@ -166,9 +153,7 @@ public class LaneDetector2 {
             }
         }
 
-        // =====================================================
         // 7. Защита от резких скачков
-        // =====================================================
         double maxShift = 35.0;
 
         if (currentLeft != null && smoothedLeftLane != null) {
