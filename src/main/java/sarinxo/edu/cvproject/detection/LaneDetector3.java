@@ -1,6 +1,7 @@
 package sarinxo.edu.cvproject.detection;
 
 import org.opencv.core.*;
+import org.opencv.imgproc.CLAHE;
 import org.opencv.imgproc.Imgproc;
 import java.util.*;
 
@@ -278,16 +279,273 @@ public class LaneDetector3 {
         return maxIdx;
     }
 
-    private int meanX(List<Point> pts) {
-        double sum = 0;
-        for (Point p : pts) sum += p.x;
-        return (int)(sum / pts.size());
-    }
-
     private double[] smooth(double[] prev, double[] curr, double alpha) {
         double[] out = new double[3];
         for (int i = 0; i < 3; i++)
             out[i] = alpha * curr[i] + (1 - alpha) * prev[i];
         return out;
     }
+
+    public static Mat extractMarkings(Mat input) {
+
+        // --- 1. Лёгкая нормализация (без агрессивного CLAHE) ---
+        Mat hsv = new Mat();
+        Imgproc.cvtColor(input, hsv, Imgproc.COLOR_BGR2HSV);
+
+        // --- 2. Маска "белой разметки" через HSV ---
+        // Настроено так, чтобы:
+        // a1a0a1 (≈161,160,161) и 979798 (≈151,151,152) ПРОХОДИЛИ
+        // но bbbab9 / d6d2d6 уходили дальше на отсев
+        Mat whiteMask = new Mat();
+        Core.inRange(hsv,
+                new Scalar(0, 0, 150),     // S низкая, V от среднего+
+                new Scalar(180, 35, 255),
+                whiteMask);
+
+        // --- 3. Фильтр "настоящий белый" через близость каналов BGR ---
+        // белая разметка: R ≈ G ≈ B
+        List<Mat> bgr = new ArrayList<>();
+        Core.split(input, bgr);
+
+        Mat diff1 = new Mat();
+        Mat diff2 = new Mat();
+        Mat diff3 = new Mat();
+
+        Core.absdiff(bgr.get(0), bgr.get(1), diff1);
+        Core.absdiff(bgr.get(1), bgr.get(2), diff2);
+        Core.absdiff(bgr.get(2), bgr.get(0), diff3);
+
+        Mat colorDiff = new Mat();
+        Core.add(diff1, diff2, colorDiff);
+        Core.add(colorDiff, diff3, colorDiff);
+
+        // маленькая разница → "серо-белый"
+        Mat neutralMask = new Mat();
+        Imgproc.threshold(colorDiff, neutralMask, 60, 255, Imgproc.THRESH_BINARY_INV);
+
+        // --- 4. Убираем "слишком светлую дорогу" через локальный контраст ---
+        Mat gray = new Mat();
+        Imgproc.cvtColor(input, gray, Imgproc.COLOR_BGR2GRAY);
+
+        Mat gradX = new Mat();
+        Mat gradY = new Mat();
+
+        Imgproc.Sobel(gray, gradX, CvType.CV_16S, 1, 0);
+        Imgproc.Sobel(gray, gradY, CvType.CV_16S, 0, 1);
+
+        Mat absX = new Mat();
+        Mat absY = new Mat();
+
+        Core.convertScaleAbs(gradX, absX);
+        Core.convertScaleAbs(gradY, absY);
+
+        Mat gradient = new Mat();
+        Core.addWeighted(absX, 0.5, absY, 0.5, 0, gradient);
+
+        Mat edgeMask = new Mat();
+        Imgproc.threshold(gradient, edgeMask, 15, 255, Imgproc.THRESH_BINARY);
+
+        // --- 5. Комбинация ---
+        Mat result = new Mat();
+
+        // цвет + нейтральность (убирает цветной шум)
+        Core.bitwise_and(whiteMask, neutralMask, result);
+
+        // добавляем требование границы (убирает дорогу)
+        Core.bitwise_and(result, edgeMask, result);
+
+        // --- 6. ROI (чтобы не ловить небо) ---
+        Mat roiMask = Mat.zeros(result.size(), CvType.CV_8UC1);
+        Imgproc.rectangle(roiMask,
+                new Point(0, result.rows() * 0.35),
+                new Point(result.cols(), result.rows()),
+                new Scalar(255),
+                -1);
+
+        Core.bitwise_and(result, roiMask, result);
+
+        // --- 7. Лёгкая морфология ---
+        Mat kernel = Imgproc.getStructuringElement(
+                Imgproc.MORPH_RECT, new Size(3, 3));
+
+        Imgproc.morphologyEx(result, result,
+                Imgproc.MORPH_CLOSE, kernel);
+
+        return result;
+    }
+
+   /* public static Mat extractMarkings(Mat input) {
+
+        // --- 1. Лёгкая нормализация (без агрессивного CLAHE) ---
+        Mat hsv = new Mat();
+        Imgproc.cvtColor(input, hsv, Imgproc.COLOR_BGR2HSV);
+
+        // --- 2. Маска "белой разметки" через HSV ---
+        // Настроено так, чтобы:
+        // a1a0a1 (≈161,160,161) и 979798 (≈151,151,152) ПРОХОДИЛИ
+        // но bbbab9 / d6d2d6 уходили дальше на отсев
+        Mat whiteMask = new Mat();
+        Core.inRange(hsv,
+                new Scalar(0, 0, 150),     // S низкая, V от среднего+
+                new Scalar(180, 35, 255),
+                whiteMask);
+
+        // --- 3. Фильтр "настоящий белый" через близость каналов BGR ---
+        // белая разметка: R ≈ G ≈ B
+        List<Mat> bgr = new ArrayList<>();
+        Core.split(input, bgr);
+
+        Mat diffRG = new Mat();
+        Mat diffGB = new Mat();
+        Mat diffBR = new Mat();
+
+        Core.absdiff(bgr.get(2), bgr.get(1), diffRG);
+        Core.absdiff(bgr.get(1), bgr.get(0), diffGB);
+        Core.absdiff(bgr.get(0), bgr.get(2), diffBR);
+
+        Mat colorDiff = new Mat();
+        Core.add(diffRG, diffGB, colorDiff);
+        Core.add(colorDiff, diffBR, colorDiff);
+
+        // маленькая разница → "серо-белый"
+        Mat neutralMask = new Mat();
+        Imgproc.threshold(colorDiff, neutralMask, 60, 255, Imgproc.THRESH_BINARY_INV);
+
+        // --- 4. Убираем "слишком светлую дорогу" через локальный контраст ---
+        Mat gray = new Mat();
+        Imgproc.cvtColor(input, gray, Imgproc.COLOR_BGR2GRAY);
+
+        Mat gradX = new Mat();
+        Mat gradY = new Mat();
+
+        Imgproc.Sobel(gray, gradX, CvType.CV_16S, 1, 0);
+        Imgproc.Sobel(gray, gradY, CvType.CV_16S, 0, 1);
+
+        Mat absX = new Mat();
+        Mat absY = new Mat();
+
+        Core.convertScaleAbs(gradX, absX);
+        Core.convertScaleAbs(gradY, absY);
+
+        Mat gradient = new Mat();
+        Core.addWeighted(absX, 0.5, absY, 0.5, 0, gradient);
+
+        Mat edgeMask = new Mat();
+        Imgproc.threshold(gradient, edgeMask, 15, 255, Imgproc.THRESH_BINARY);
+
+        // --- 5. Комбинация ---
+        Mat result = new Mat();
+
+        // цвет + нейтральность (убирает цветной шум)
+        Core.bitwise_and(whiteMask, neutralMask, result);
+
+        // добавляем требование границы (убирает дорогу)
+        Core.bitwise_and(result, edgeMask, result);
+
+        // --- 6. ROI (чтобы не ловить небо) ---
+        Mat roiMask = Mat.zeros(result.size(), CvType.CV_8UC1);
+        Imgproc.rectangle(roiMask,
+                new Point(0, result.rows() * 0.35),
+                new Point(result.cols(), result.rows()),
+                new Scalar(255),
+                -1);
+
+        Core.bitwise_and(result, roiMask, result);
+
+        // --- 7. Лёгкая морфология ---
+        Mat kernel = Imgproc.getStructuringElement(
+                Imgproc.MORPH_RECT, new Size(3, 3));
+
+        Imgproc.morphologyEx(result, result,
+                Imgproc.MORPH_CLOSE, kernel);
+
+        return result;
+    }
+
+    public Mat extractMarkings(Mat input) {
+        Mat lab = new Mat();
+        Imgproc.cvtColor(input, lab, Imgproc.COLOR_BGR2Lab);
+
+        java.util.List<Mat> labChannels = new java.util.ArrayList<>();
+        Core.split(lab, labChannels);
+
+        CLAHE clahe = Imgproc.createCLAHE(1.8, new Size(8, 8));
+        clahe.apply(labChannels.get(0), labChannels.get(0));
+
+        Core.merge(labChannels, lab);
+
+        Mat enhanced = new Mat();
+        Imgproc.cvtColor(lab, enhanced, Imgproc.COLOR_Lab2BGR);
+
+        // === 2. HSV ===
+        Mat hsv = new Mat();
+        Imgproc.cvtColor(enhanced, hsv, Imgproc.COLOR_BGR2HSV);
+
+        // === 3. Цветовые маски (ослаблены) ===
+        Mat pureWhite = new Mat();
+        Core.inRange(hsv,
+                new Scalar(0, 0, 150),
+                new Scalar(180, 35, 255),
+                pureWhite);
+
+        Mat yellowishWhite = new Mat();
+        Core.inRange(hsv,
+                new Scalar(12, 20, 160),
+                new Scalar(45, 140, 255),
+                yellowishWhite);
+
+        Core.subtract(yellowishWhite, pureWhite, yellowishWhite);
+
+        Mat colorMask = new Mat();
+        Core.bitwise_or(pureWhite, yellowishWhite, colorMask);
+
+        // === 4. МЯГКИЙ градиент ===
+        Mat gray = new Mat();
+        Imgproc.cvtColor(input, gray, Imgproc.COLOR_BGR2GRAY);
+
+        Imgproc.GaussianBlur(gray, gray, new Size(5, 5), 0);
+
+        Mat gradX = new Mat();
+        Mat gradY = new Mat();
+
+        Imgproc.Sobel(gray, gradX, CvType.CV_16S, 1, 0);
+        Imgproc.Sobel(gray, gradY, CvType.CV_16S, 0, 1);
+
+        Mat absX = new Mat();
+        Mat absY = new Mat();
+
+        Core.convertScaleAbs(gradX, absX);
+        Core.convertScaleAbs(gradY, absY);
+
+        Mat gradient = new Mat();
+        Core.addWeighted(absX, 0.5, absY, 0.5, 0, gradient);
+
+        // ↓ ПОРОГ СИЛЬНО СНИЖЕН
+        Mat edgeMask = new Mat();
+        Imgproc.threshold(gradient, edgeMask, 20, 255, Imgproc.THRESH_BINARY);
+
+        // ↓ НЕ ЖЕСТКОЕ AND, а "усиление"
+        Mat result = new Mat();
+        Core.bitwise_and(colorMask, edgeMask, result);
+        Core.bitwise_or(result, colorMask, result);
+
+        // === 5. ROI мягче (оставляем больше) ===
+        Mat roiMask = Mat.zeros(result.size(), CvType.CV_8UC1);
+        Imgproc.rectangle(roiMask,
+                new Point(0, result.rows() * 0.3),
+                new Point(result.cols(), result.rows()),
+                new Scalar(255),
+                -1);
+
+        Core.bitwise_and(result, roiMask, result);
+
+        // === 6. Морфология мягче ===
+        Mat kernel = Imgproc.getStructuringElement(
+                Imgproc.MORPH_RECT, new Size(5, 5));
+
+        Imgproc.morphologyEx(result, result,
+                Imgproc.MORPH_CLOSE, kernel);
+
+        return result;
+    }*/
 }

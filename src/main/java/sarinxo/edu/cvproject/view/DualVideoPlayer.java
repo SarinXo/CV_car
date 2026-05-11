@@ -34,7 +34,9 @@ import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 import sarinxo.edu.cvproject.LaneDetector;
 import sarinxo.edu.cvproject.LaneDetector2;
+import sarinxo.edu.cvproject.detection.LaneCurveDetector;
 import sarinxo.edu.cvproject.detection.LaneDetector3;
+import sarinxo.edu.cvproject.detection.LaneMarkingMaskExtractor;
 import sarinxo.edu.cvproject.detection.PerspectiveInitializer;
 
 import java.io.ByteArrayInputStream;
@@ -218,14 +220,12 @@ public class DualVideoPlayer {
 
         Mat frame = new Mat();
         List<Image> processedFrames = new ArrayList<>();
-        LaneDetector3 detector = null;
+        LaneMarkingMaskExtractor maskExtractor = new LaneMarkingMaskExtractor();
+        LaneCurveDetector detector = new LaneCurveDetector();
         while (capture.read(frame)) {
             if (frame.empty()) continue;
-            if (detector == null) {
-                PerspectiveInitializer.Result initialize = new PerspectiveInitializer().initialize(frame);
-                detector = new LaneDetector3(initialize.src, initialize.dst);
-            }
-            Mat processed = detector.processFrame(frame);//тута
+            Mat mask = maskExtractor.process(frame);//тута
+            Mat processed = detector.process(frame, mask);//здеся
             Image fxImage = matToImage(processed);
             processedFrames.add(fxImage);
         }
@@ -261,72 +261,6 @@ public class DualVideoPlayer {
         stopButton.setDisable(disabled);
         seek1.setDisable(disabled);
         volume1.setDisable(disabled);
-    }
-
-    //todo delete
-    private Mat detectLanes(Mat frame) {
-        Mat hsv = new Mat();
-        Mat maskWhite = new Mat();
-        Mat maskYellow = new Mat();
-        Mat mask = new Mat();
-
-        Imgproc.cvtColor(frame, hsv, Imgproc.COLOR_BGR2HSV);
-        Core.inRange(hsv, new Scalar(0, 0, 200), new Scalar(180, 30, 255), maskWhite);
-        Core.inRange(hsv, new Scalar(15, 100, 100), new Scalar(35, 255, 255), maskYellow);
-        Core.addWeighted(maskWhite, 1.0, maskYellow, 1.0, 0, mask);
-
-        Mat edges = new Mat();
-        Imgproc.GaussianBlur(mask, mask, new Size(5, 5), 0);
-        Imgproc.Canny(mask, edges, 50, 150);
-
-        int w = edges.width();
-        int h = edges.height();
-        Mat maskedEdges = Mat.zeros(edges.size(), edges.type());
-        Point p1 = new Point(0, h), p2 = new Point(w, h), p3 = new Point(w * 0.9, h * 0.6), p4 = new Point(w * 0.1, h * 0.6);
-        MatOfPoint poly = new MatOfPoint(p1, p2, p3, p4);
-        List<MatOfPoint> polys = new ArrayList<>();
-        polys.add(poly);
-        Imgproc.fillPoly(maskedEdges, polys, new Scalar(255));
-        Core.bitwise_and(edges, maskedEdges, maskedEdges);
-
-        Mat lines = new Mat();
-        Imgproc.HoughLinesP(maskedEdges, lines, 1, Math.PI / 180, 50, 20, 10);
-
-        Mat output = frame.clone();
-        double centerX = w / 2.0;
-
-        List<double[]> leftLines = new ArrayList<>();
-        List<double[]> rightLines = new ArrayList<>();
-
-        for (int i = 0; i < lines.rows(); i++) {
-            double[] l = lines.get(i, 0);
-            double x1 = l[0], y1 = l[1], x2 = l[2], y2 = l[3];
-            double slope = (y2 - y1) / (x2 - x1 + 1e-6);
-            if (Math.abs(slope) < 0.4) continue;
-
-            if (slope < 0 && x1 < centerX && x2 < centerX) leftLines.add(l);
-            else if (slope > 0 && x1 > centerX && x2 > centerX) rightLines.add(l);
-        }
-
-        drawSegments(output, leftLines, new Scalar(255, 100, 0));
-        drawSegments(output, rightLines, new Scalar(0, 100, 255));
-
-        hsv.release();
-        maskWhite.release();
-        maskYellow.release();
-        mask.release();
-        edges.release();
-        maskedEdges.release();
-        lines.release();
-        poly.release();
-
-        return output;
-    }
-
-    private void drawSegments(Mat img, List<double[]> lines, Scalar color) {
-        for (double[] l : lines) {
-            Imgproc.line(img, new Point(l[0], l[1]), new Point(l[2], l[3]), color, 4);
-        }
     }
 
     private Image matToImage(Mat mat) {
