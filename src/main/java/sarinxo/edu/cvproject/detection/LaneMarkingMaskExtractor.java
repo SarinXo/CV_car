@@ -161,20 +161,20 @@ public final class LaneMarkingMaskExtractor {
             private double claheClipLimit         = 2.0;
             private Size   claheTileGridSize      = new Size(8, 8);
 
-            // Yellow — tightened to reject mud and tan-coloured roadside.
-            private int    labBMin                = 150;
+            // Yellow / orange — loosened so faded yellow and orange construction-zone paint pass.
+            private int    labBMin                = 135;
             private int    labBMax                = 255;
-            private int    labLMinForYellow       = 90;
+            private int    labLMinForYellow       = 70;
 
-            // White — tightened: real lane paint has very low saturation and high brightness.
-            private int    hlsLMin                = 210;
-            private int    hlsSMax                = 35;
-            private int    grayWhiteMin           = 225;
+            // White / light-gray — loosened: dim or weathered paint and gray dashes survive.
+            private int    hlsLMin                = 180;
+            private int    hlsSMax                = 60;
+            private int    grayWhiteMin           = 195;
 
             // Top-Hat — kernel sized to cover a typical paint width on dashcam footage;
-            // threshold raised so only meaningful local peaks survive.
+            // threshold lowered so weaker local peaks (faded paint) still register.
             private Size   topHatKernelSize       = new Size(15, 15);
-            private int    topHatThreshold        = 45;
+            private int    topHatThreshold        = 25;
 
             // Fusion — STRICT (AND) gives precise pixel-accurate output.
             private FusionMode fusionMode         = FusionMode.STRICT;
