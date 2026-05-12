@@ -51,13 +51,6 @@ public final class LaneCurveDetector {
         public final double roiBottomHalfWidth;
         public final double roiTopHalfWidth;
 
-        // -- Adaptive ROI centre (estimates road centre from the mask each frame) --
-        public final boolean adaptiveCenterEnabled;
-        public final double  centerEstimateAlpha;            // EMA factor for the per-frame estimate
-        public final double  centerStripHeightRatio;         // fraction of frame height sampled at the bottom
-        public final double  centerEstimateSearchMargin;     // peaks must lie in [margin, 1−margin] of frame width
-        public final double  centerEstimateMinSeparationRatio; // min |xL − xR| / frameWidth between peaks
-        public final int     centerEstimateMinPeakSum;       // min column-sum to accept a peak
 
         // -- BEV target size --
         public final int bevWidth;
@@ -74,6 +67,9 @@ public final class LaneCurveDetector {
         // -- Parallel-lane hypothesis fallback --
         public final double laneWidthAlpha;            // EMA factor for the learned BEV lane width
         public final double hypothesisMinSupportFraction;  // fraction of y-range that must show mask support to accept a hypothesised lane
+
+        // -- Diagnostics overlay --
+        public final boolean diagnosticsOverlay;       // draw a compact info box in the top-right corner
 
         // -- Sliding window --
         public final int    slidingWindowCount;
@@ -102,12 +98,6 @@ public final class LaneCurveDetector {
             this.roiTopY                 = b.roiTopY;
             this.roiBottomHalfWidth      = b.roiBottomHalfWidth;
             this.roiTopHalfWidth         = b.roiTopHalfWidth;
-            this.adaptiveCenterEnabled           = b.adaptiveCenterEnabled;
-            this.centerEstimateAlpha             = b.centerEstimateAlpha;
-            this.centerStripHeightRatio          = b.centerStripHeightRatio;
-            this.centerEstimateSearchMargin      = b.centerEstimateSearchMargin;
-            this.centerEstimateMinSeparationRatio = b.centerEstimateMinSeparationRatio;
-            this.centerEstimateMinPeakSum        = b.centerEstimateMinPeakSum;
             this.bevWidth                = b.bevWidth;
             this.bevHeight               = b.bevHeight;
             this.histogramMinPeakSum     = b.histogramMinPeakSum;
@@ -116,6 +106,7 @@ public final class LaneCurveDetector {
             this.outputMinRunLength           = b.outputMinRunLength;
             this.laneWidthAlpha               = b.laneWidthAlpha;
             this.hypothesisMinSupportFraction = b.hypothesisMinSupportFraction;
+            this.diagnosticsOverlay           = b.diagnosticsOverlay;
             this.slidingWindowCount       = b.slidingWindowCount;
             this.slidingWindowMarginX     = b.slidingWindowMarginX;
             this.slidingWindowMinPixels   = b.slidingWindowMinPixels;
@@ -136,26 +127,15 @@ public final class LaneCurveDetector {
         public static Builder builder()  { return new Builder(); }
 
         public static final class Builder {
-            // ROI — narrowed to roughly the visible ego-lane footprint. A tight trapezoid is
-            // critical: any wall, barrier or roadside foliage left inside the ROI projects to
-            // BEV as a strong vertical-looking cluster that the histogram will treat as a lane
-            // base and the sliding window will then trace as if it were real paint.
+            // Fixed ROI trapezoid (perspective source for the BEV warp). Bottom half-width
+            // is generous so that lanes which run to the very edges of the frame (wide-FOV
+            // cameras, narrow visible roads) stay inside the warp; top half-width is narrow
+            // because forward-facing lanes converge near the optical axis. Adjust manually
+            // for an off-centre dashcam or an unusual crop.
             private double  roiBottomY              = 0.95;
             private double  roiTopY                 = 0.62;
-            private double  roiBottomHalfWidth      = 0.35;
-            private double  roiTopHalfWidth         = 0.10;
-
-            // Adaptive centre — automatic horizontal offset of the trapezoid based on where the
-            // two strongest lane bases appear at the bottom of the mask. Handles dashcams that
-            // are not mounted on the car's longitudinal centreline.
-            private boolean adaptiveCenterEnabled            = true;
-            private double  centerEstimateAlpha              = 0.20;
-            private double  centerStripHeightRatio           = 0.08;
-            // Peaks must live in the interior 80% of the frame — pure edges almost always
-            // contain barrier / foliage clutter, not lane paint.
-            private double  centerEstimateSearchMargin       = 0.10;
-            private double  centerEstimateMinSeparationRatio = 0.15;
-            private int     centerEstimateMinPeakSum         = 10 * 255;
+            private double  roiBottomHalfWidth      = 0.48;
+            private double  roiTopHalfWidth         = 0.12;
 
             // BEV resolution — independent of input frame size.
             private int     bevWidth                = 400;
@@ -163,8 +143,11 @@ public final class LaneCurveDetector {
 
             // Histogram peak threshold. Mask pixels are 0/255, so a column-sum value of
             // (N × 255) means N white pixels accumulated in that column of the histogram band.
-            // 25 pixels is enough to dismiss isolated noise but accept short dashes.
-            private int     histogramMinPeakSum     = 25 * 255;
+            // A solid lane that is slightly tilted in BEV (sharp curve) yields only ~10
+            // pixels per column — we must accept that, since downstream defences (per-window
+            // geometric guards, robustFit, walk-validation against the mask) will reject
+            // anything that turns out not to be paint.
+            private int     histogramMinPeakSum     = 10 * 255;
 
             // Bottom 55% of BEV used for the histogram. Wider than 1/3 so a far-away dashed
             // line, which is still in the middle of BEV, also contributes to its peak.
@@ -174,8 +157,9 @@ public final class LaneCurveDetector {
             // y-intervals where the mask actually has paint within ±outputSupportHalfWidthPx
             // of the curve. outputMinRunLength filters out specks; intervals shorter than
             // this number of BEV pixels are dropped so single hot pixels do not become dashes.
+            // 4 px keeps short far-away dashes visible while still rejecting isolated noise.
             private int     outputSupportHalfWidthPx     = 18;
-            private int     outputMinRunLength           = 8;
+            private int     outputMinRunLength           = 4;
 
             // Lane-width EMA — smooths the BEV distance between confirmed left and right
             // lanes across frames, then used as a parallel-lane hypothesis when one side
@@ -187,12 +171,18 @@ public final class LaneCurveDetector {
             // 0.20 = 20%: enough for a sparse dashed line, strict enough to reject noise.
             private double  hypothesisMinSupportFraction = 0.20;
 
+            // Toggle the in-frame diagnostics overlay (top-right corner of output).
+            private boolean diagnosticsOverlay = true;
+
             // Sliding window — 9 vertical slices is the standard Udacity-style setup.
             // Margin tightened so the window stays close to the lane and resists pull
-            // from neighbouring objects (wheels, signs).
+            // from neighbouring objects (wheels, signs). Min pixels is the threshold at
+            // which the window trusts its local line fit; below this, pixels are still
+            // collected (so sparse dashes are not lost), only the line-based filtering
+            // is bypassed.
             private int    slidingWindowCount       = 9;
             private int    slidingWindowMarginX     = 45;
-            private int    slidingWindowMinPixels   = 20;
+            private int    slidingWindowMinPixels   = 10;
 
             // Per-window geometric guards — derived from the physical assumption that lane
             // marking is locally near-vertical in BEV and changes direction smoothly.
@@ -203,9 +193,10 @@ public final class LaneCurveDetector {
             private double windowLaneHalfWidthPx    = 15.0;
 
             // Cubic polynomial — captures S-curves and roundabouts; quadratic is too rigid
-            // to trace strong curvature faithfully.
+            // to trace strong curvature faithfully. minPointsForFit is the minimum sample
+            // size to attempt the fit; it must exceed polynomialDegree.
             private int     polynomialDegree        = 3;
-            private int     minPointsForFit         = 25;
+            private int     minPointsForFit         = 15;
 
             // RANSAC-style outlier rejection. After the initial fit, pixels whose horizontal
             // distance to the polynomial exceeds residualThresholdPx are dropped, then the
@@ -224,12 +215,6 @@ public final class LaneCurveDetector {
             public Builder roiTopY(double v)                 { this.roiTopY = v; return this; }
             public Builder roiBottomHalfWidth(double v)      { this.roiBottomHalfWidth = v; return this; }
             public Builder roiTopHalfWidth(double v)         { this.roiTopHalfWidth = v; return this; }
-            public Builder adaptiveCenterEnabled(boolean v)            { this.adaptiveCenterEnabled = v; return this; }
-            public Builder centerEstimateAlpha(double v)               { this.centerEstimateAlpha = v; return this; }
-            public Builder centerStripHeightRatio(double v)            { this.centerStripHeightRatio = v; return this; }
-            public Builder centerEstimateSearchMargin(double v)        { this.centerEstimateSearchMargin = v; return this; }
-            public Builder centerEstimateMinSeparationRatio(double v)  { this.centerEstimateMinSeparationRatio = v; return this; }
-            public Builder centerEstimateMinPeakSum(int v)             { this.centerEstimateMinPeakSum = v; return this; }
             public Builder bevWidth(int v)                   { this.bevWidth = v; return this; }
             public Builder bevHeight(int v)                  { this.bevHeight = v; return this; }
             public Builder histogramMinPeakSum(int v)        { this.histogramMinPeakSum = v; return this; }
@@ -238,6 +223,7 @@ public final class LaneCurveDetector {
             public Builder outputMinRunLength(int v)                  { this.outputMinRunLength = v; return this; }
             public Builder laneWidthAlpha(double v)                   { this.laneWidthAlpha = v; return this; }
             public Builder hypothesisMinSupportFraction(double v)     { this.hypothesisMinSupportFraction = v; return this; }
+            public Builder diagnosticsOverlay(boolean v)              { this.diagnosticsOverlay = v; return this; }
             public Builder slidingWindowCount(int v)         { this.slidingWindowCount = v; return this; }
             public Builder slidingWindowMarginX(int v)       { this.slidingWindowMarginX = v; return this; }
             public Builder slidingWindowMinPixels(int v)     { this.slidingWindowMinPixels = v; return this; }
@@ -276,14 +262,6 @@ public final class LaneCurveDetector {
                     throw new IllegalArgumentException("laneWidthAlpha must be in (0,1]");
                 if (hypothesisMinSupportFraction < 0 || hypothesisMinSupportFraction > 1)
                     throw new IllegalArgumentException("hypothesisMinSupportFraction must be in [0,1]");
-                if (centerEstimateAlpha <= 0 || centerEstimateAlpha > 1)
-                    throw new IllegalArgumentException("centerEstimateAlpha must be in (0,1]");
-                if (centerStripHeightRatio <= 0 || centerStripHeightRatio > 1)
-                    throw new IllegalArgumentException("centerStripHeightRatio must be in (0,1]");
-                if (centerEstimateSearchMargin < 0 || centerEstimateSearchMargin >= 0.5)
-                    throw new IllegalArgumentException("centerEstimateSearchMargin must be in [0,0.5)");
-                if (centerEstimateMinSeparationRatio < 0 || centerEstimateMinSeparationRatio > 1)
-                    throw new IllegalArgumentException("centerEstimateMinSeparationRatio must be in [0,1]");
                 if (maxAngleFromVerticalDeg <= 0 || maxAngleFromVerticalDeg > 89)
                     throw new IllegalArgumentException("maxAngleFromVerticalDeg must be in (0,89]");
                 if (maxAngleStepDeg <= 0 || maxAngleStepDeg > 89)
@@ -309,14 +287,9 @@ public final class LaneCurveDetector {
 
     private int     lastWidth        = -1;
     private int     lastHeight       = -1;
-    private double  lastCenterRatio  = Double.NaN;
     private Point[] roiPolygonImage  = null;
     private Mat     origToBevMatrix  = null;
     private Mat     bevToOrigMatrix  = null;
-
-    // EMA estimate of the road horizontal centre, as a fraction of frame width.
-    // Updated each frame from the bottom-strip histogram; NaN means "no estimate yet".
-    private double  currentCenterXRatio = Double.NaN;
 
     // EMA estimate of lane width in BEV pixels, learned from frames where both lanes were
     // detected. Drives the parallel-lane hypothesis when only one side is found.
@@ -332,24 +305,31 @@ public final class LaneCurveDetector {
         public final int     rightPixels;
         public final boolean leftDetected;
         public final boolean rightDetected;
-        public final double  centerXRatio;       // adaptive ROI centre (image-space, fraction of width)
+        public final boolean leftIsHypothesis;
+        public final boolean rightIsHypothesis;
+        public final double  laneWidthBev;        // EMA lane width in BEV pixels; NaN until learnt
 
-        Diagnostics(int lb, int rb, int lp, int rp, boolean ld, boolean rd, double cxr) {
-            this.leftBaseX     = lb;
-            this.rightBaseX    = rb;
-            this.leftPixels    = lp;
-            this.rightPixels   = rp;
-            this.leftDetected  = ld;
-            this.rightDetected = rd;
-            this.centerXRatio  = cxr;
+        Diagnostics(int lb, int rb, int lp, int rp, boolean ld, boolean rd,
+                    boolean lh, boolean rh, double lwb) {
+            this.leftBaseX         = lb;
+            this.rightBaseX        = rb;
+            this.leftPixels        = lp;
+            this.rightPixels       = rp;
+            this.leftDetected      = ld;
+            this.rightDetected     = rd;
+            this.leftIsHypothesis  = lh;
+            this.rightIsHypothesis = rh;
+            this.laneWidthBev      = lwb;
         }
 
         @Override public String toString() {
             return String.format(
                     "Diagnostics{leftBaseX=%d, rightBaseX=%d, leftPixels=%d, rightPixels=%d, "
-                    + "leftDetected=%s, rightDetected=%s, centerXRatio=%.3f}",
+                    + "leftDetected=%s, rightDetected=%s, leftHypothesis=%s, rightHypothesis=%s, "
+                    + "laneWidthBev=%.1f}",
                     leftBaseX, rightBaseX, leftPixels, rightPixels,
-                    leftDetected, rightDetected, centerXRatio);
+                    leftDetected, rightDetected, leftIsHypothesis, rightIsHypothesis,
+                    laneWidthBev);
         }
     }
     private Diagnostics lastDiagnostics = null;
@@ -379,19 +359,7 @@ public final class LaneCurveDetector {
         if (frame.width() != mask.width() || frame.height() != mask.height())
             throw new IllegalArgumentException("frame and mask must have identical dimensions");
 
-        if (config.adaptiveCenterEnabled) {
-            double frameCenterRatio = estimateRoadCenterRatio(mask);
-            if (!Double.isNaN(frameCenterRatio)) {
-                if (Double.isNaN(currentCenterXRatio)) {
-                    currentCenterXRatio = frameCenterRatio;            // bootstrap from first valid frame
-                } else {
-                    double a = config.centerEstimateAlpha;
-                    currentCenterXRatio = (1 - a) * currentCenterXRatio + a * frameCenterRatio;
-                }
-            }
-        }
-        double centerRatio = Double.isNaN(currentCenterXRatio) ? 0.5 : currentCenterXRatio;
-        ensureGeometry(frame.width(), frame.height(), centerRatio);
+        ensureGeometry(frame.width(), frame.height());
 
         Mat roiMask = applyRoi(mask);
         Mat bev     = new Mat();
@@ -442,7 +410,10 @@ public final class LaneCurveDetector {
                     leftBaseX, rightBaseX,
                     leftPixels.size(), rightPixels.size(),
                     leftCoef != null, rightCoef != null,
-                    centerRatio);
+                    leftIsHypothesis, rightIsHypothesis,
+                    learnedLaneWidthBev);
+
+            if (config.diagnosticsOverlay) drawDiagnosticsOverlay(output, lastDiagnostics);
 
             return output;
         } finally {
@@ -454,8 +425,6 @@ public final class LaneCurveDetector {
     public void reset() {
         lastWidth           = -1;
         lastHeight          = -1;
-        lastCenterRatio     = Double.NaN;
-        currentCenterXRatio = Double.NaN;
         learnedLaneWidthBev = Double.NaN;
         releaseCachedGeometry();
     }
@@ -483,23 +452,31 @@ public final class LaneCurveDetector {
      * forward-facing camera is on the camera's optical axis, regardless of lateral mount
      * position. Rebuilding happens only when frame size or centre changed materially.
      */
-    private void ensureGeometry(int w, int h, double centerXRatio) {
-        if (w == lastWidth && h == lastHeight
-                && Math.abs(centerXRatio - lastCenterRatio) < 0.003) return;
+    /**
+     * Build the fixed ROI trapezoid and the BEV perspective matrices from {@link Config}.
+     * Centred at the image centre, wide bottom, narrow top — a forward-facing dashcam
+     * geometry that captures lanes from the camera-near bottom edge of the frame up to
+     * the vanishing-point region near the optical axis. The bottom corners are clamped to
+     * the frame so a very wide trapezoid never references coordinates outside the frame.
+     */
+    private void ensureGeometry(int w, int h) {
+        if (w == lastWidth && h == lastHeight) return;
         releaseCachedGeometry();
 
-        double cxBottom    = w * centerXRatio;
-        double cxTop       = w * 0.5;
-        double bottomY     = h * config.roiBottomY;
-        double topY        = h * config.roiTopY;
-        double bottomHalf  = w * config.roiBottomHalfWidth;
-        double topHalf     = w * config.roiTopHalfWidth;
+        double cx       = w * 0.5;
+        double bottomY  = h * config.roiBottomY;
+        double topY     = h * config.roiTopY;
+        double bHalf    = w * config.roiBottomHalfWidth;
+        double tHalf    = w * config.roiTopHalfWidth;
+
+        double bottomLeft  = Math.max(0, cx - bHalf);
+        double bottomRight = Math.min(w, cx + bHalf);
 
         roiPolygonImage = new Point[] {
-                new Point(cxBottom - bottomHalf, bottomY),
-                new Point(cxTop    - topHalf,    topY),
-                new Point(cxTop    + topHalf,    topY),
-                new Point(cxBottom + bottomHalf, bottomY)
+                new Point(bottomLeft,    bottomY),
+                new Point(cx - tHalf,    topY),
+                new Point(cx + tHalf,    topY),
+                new Point(bottomRight,   bottomY)
         };
 
         Point[] dst = new Point[] {
@@ -518,9 +495,8 @@ public final class LaneCurveDetector {
             dst2f.release();
         }
 
-        lastWidth       = w;
-        lastHeight      = h;
-        lastCenterRatio = centerXRatio;
+        lastWidth  = w;
+        lastHeight = h;
     }
 
     private Mat applyRoi(Mat mask) {
@@ -534,53 +510,6 @@ public final class LaneCurveDetector {
         } finally {
             roi.release();
             poly.release();
-        }
-    }
-
-    // =========================================================================================
-    // Adaptive ROI centre — estimate where the road is centred in the current frame
-    // =========================================================================================
-
-    /**
-     * Estimate the road's horizontal centre from a bottom strip of the mask, in image space.
-     * Both lane lines are at their most separated and most reliable near the camera, so we
-     * sum a thin band at the bottom of the frame into a column histogram and pick the two
-     * strongest peaks inside the interior of the frame (edges typically contain barrier /
-     * foliage clutter). The mid-point of those peaks is the estimate. Returns {@code NaN}
-     * when fewer than two usable peaks are present — the caller keeps the previous estimate.
-     */
-    private double estimateRoadCenterRatio(Mat mask) {
-        int stripH = (int) Math.max(5, Math.round(mask.rows() * config.centerStripHeightRatio));
-        Mat strip  = mask.submat(mask.rows() - stripH, mask.rows(), 0, mask.cols());
-        Mat hMat   = new Mat();
-        try {
-            Core.reduce(strip, hMat, 0, Core.REDUCE_SUM, CvType.CV_32S);
-            int w = hMat.cols();
-            int[] hist = new int[w];
-            hMat.get(0, 0, hist);
-
-            int searchLow  = (int) (w * config.centerEstimateSearchMargin);
-            int searchHigh = (int) (w * (1.0 - config.centerEstimateSearchMargin));
-            int minSep     = (int) (w * config.centerEstimateMinSeparationRatio);
-            int minPeakVal = config.centerEstimateMinPeakSum;
-
-            int max1V = -1, max1X = -1;
-            for (int x = searchLow; x < searchHigh; x++) {
-                if (hist[x] > max1V) { max1V = hist[x]; max1X = x; }
-            }
-            if (max1V < minPeakVal) return Double.NaN;
-
-            int max2V = -1, max2X = -1;
-            for (int x = searchLow; x < searchHigh; x++) {
-                if (Math.abs(x - max1X) < minSep) continue;
-                if (hist[x] > max2V) { max2V = hist[x]; max2X = x; }
-            }
-            if (max2V < minPeakVal) return Double.NaN;
-
-            return ((max1X + max2X) / 2.0) / w;
-        } finally {
-            strip.release();
-            hMat.release();
         }
     }
 
@@ -690,12 +619,31 @@ public final class LaneCurveDetector {
                 try {
                     Core.findNonZero(slice, nonZero);
                     int n = (int) nonZero.total();
-                    if (n < minPix) continue;                   // too sparse — keep predicted state
+                    if (n == 0) continue;
 
-                    Point[] local = nonZero.toArray();
+                    Point[] local  = nonZero.toArray();
                     Point[] absPts = new Point[local.length];
                     for (int i = 0; i < local.length; i++) {
                         absPts[i] = new Point(xLow + local[i].x, yLow + local[i].y);
+                    }
+
+                    if (n < minPix) {
+                        // Too sparse to fit a reliable local line, but still useful evidence
+                        // (a single far-away dash, a tiny gap-bridge). Keep the pixels that
+                        // lie close to the *predicted* axis from the previous accepted window;
+                        // robustFit downstream and walk-validation against the mask will reject
+                        // anything that is not actually on the lane.
+                        if (prevMidY < 0) {
+                            // No prediction yet — accept all pixels of this first window,
+                            // they seed the trajectory.
+                            for (Point p : absPts) collected.add(p);
+                        } else {
+                            for (Point p : absPts) {
+                                double dx = p.x - (currentX + currentSlope * (p.y - prevMidY));
+                                if (Math.abs(dx) <= halfWidth) collected.add(p);
+                            }
+                        }
+                        continue;
                     }
 
                     // Local line fit — Huber resists pull from off-axis clusters within the window.
@@ -907,6 +855,70 @@ public final class LaneCurveDetector {
         } finally {
             mop.release();
         }
+    }
+
+    /**
+     * Compact diagnostics overlay in the top-right corner of {@code output}:
+     * <pre>
+     *   L  base=87  px=234  OK
+     *   R  base=312 px=145  HY
+     *   cx 0.487  lw 225
+     * </pre>
+     * Status tag: {@code OK} = real detection, {@code HY} = hypothesised from the other
+     * lane + learned width, {@code --} = not detected. The box is drawn over a translucent
+     * dark backdrop so the text stays legible regardless of the frame content.
+     */
+    private void drawDiagnosticsOverlay(Mat output, Diagnostics d) {
+        int frameW = output.cols();
+        int boxW   = Math.max(180, Math.min(260, frameW / 6));
+        int boxH   = 72;
+        int margin = 10;
+        int x0 = frameW - boxW - margin;
+        int y0 = margin;
+
+        // Translucent dark backdrop.
+        Mat roi = output.submat(y0, y0 + boxH, x0, x0 + boxW);
+        Mat dark = new Mat(roi.size(), roi.type(), new Scalar(20, 20, 20));
+        try {
+            Core.addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
+        } finally {
+            dark.release();
+            roi.release();
+        }
+
+        int    fontFace  = Imgproc.FONT_HERSHEY_SIMPLEX;
+        double fontScale = 0.42;
+        int    thickness = 1;
+        Scalar fg        = new Scalar(230, 230, 230);
+
+        int lineH = 19;
+        int textX = x0 + 8;
+        int textY = y0 + 18;
+
+        String leftStatus  = statusTag(d.leftDetected,  d.leftIsHypothesis);
+        String rightStatus = statusTag(d.rightDetected, d.rightIsHypothesis);
+
+        String l1 = String.format("L  base=%-4s px=%-4d %s",
+                d.leftBaseX  >= 0 ? Integer.toString(d.leftBaseX)  : "-",
+                d.leftPixels, leftStatus);
+        String l2 = String.format("R  base=%-4s px=%-4d %s",
+                d.rightBaseX >= 0 ? Integer.toString(d.rightBaseX) : "-",
+                d.rightPixels, rightStatus);
+        String lwStr = Double.isNaN(d.laneWidthBev) ? "-"
+                                                    : String.format("%.0f", d.laneWidthBev);
+        String l3 = String.format("lane width  %s", lwStr);
+
+        Imgproc.putText(output, l1, new Point(textX, textY),
+                fontFace, fontScale, fg, thickness, Imgproc.LINE_AA, false);
+        Imgproc.putText(output, l2, new Point(textX, textY + lineH),
+                fontFace, fontScale, fg, thickness, Imgproc.LINE_AA, false);
+        Imgproc.putText(output, l3, new Point(textX, textY + lineH * 2),
+                fontFace, fontScale, fg, thickness, Imgproc.LINE_AA, false);
+    }
+
+    private static String statusTag(boolean detected, boolean hypothesis) {
+        if (!detected)  return "--";
+        return hypothesis ? "HY" : "OK";
     }
 
     // =========================================================================================
