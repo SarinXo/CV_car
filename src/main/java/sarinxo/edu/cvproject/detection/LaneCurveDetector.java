@@ -86,6 +86,13 @@ public final class LaneCurveDetector {
         // -- Outlier rejection --
         public final double residualThresholdPx;       // BEV pixels: |x − poly(y)| over which a pixel is dropped
         public final int    refinementIterations;      // number of refit passes after initial fit
+        public final double maxFitRmsPx;               // max RMS perpendicular distance from inliers to polynomial — above this the fit is judged a 2D blob, not a 1D curve
+
+        // -- Lane heuristics (curve-level filters that reject roadside dust / spurious fits) --
+        public final double coefSmoothingAlpha;        // EMA blend with previous frame's polynomial
+        public final int    maxFramesWithoutDetection; // hold smoothed poly across at most this many missed frames
+        public final double laneWidthToleranceRatio;   // |observed − learned| / learned upper bound on the pair
+        public final double maxCurveExcursionRatio;    // a fitted curve must stay within ±this × bevWidth of BEV horizontal bounds
 
         // -- Drawing --
         public final Scalar  leftColor;
@@ -117,6 +124,11 @@ public final class LaneCurveDetector {
             this.minPointsForFit         = b.minPointsForFit;
             this.residualThresholdPx     = b.residualThresholdPx;
             this.refinementIterations    = b.refinementIterations;
+            this.maxFitRmsPx             = b.maxFitRmsPx;
+            this.coefSmoothingAlpha        = b.coefSmoothingAlpha;
+            this.maxFramesWithoutDetection = b.maxFramesWithoutDetection;
+            this.laneWidthToleranceRatio   = b.laneWidthToleranceRatio;
+            this.maxCurveExcursionRatio    = b.maxCurveExcursionRatio;
             this.leftColor               = b.leftColor;
             this.rightColor              = b.rightColor;
             this.lineThickness           = b.lineThickness;
@@ -205,6 +217,34 @@ public final class LaneCurveDetector {
             private double  residualThresholdPx     = 20.0;
             private int     refinementIterations    = 2;
 
+            // Fit-quality gate. After robustFit converges, compute the RMS perpendicular
+            // distance from every inlier to the polynomial. A real lane line gives RMS of
+            // 2-5 px (pixels hug the curve tightly); a tangled crack cluster gives RMS of
+            // 15-30 px (pixels scattered in 2D). Threshold 10 cleanly rejects clusters
+            // while leaving room for slight per-pixel jitter on real lanes.
+            private double  maxFitRmsPx             = 10.0;
+
+            // Temporal smoothing of the polynomial coefficients across frames. 0.30 keeps
+            // 70 % of the previous fit and adds 30 % of the new one — eliminates per-frame
+            // flicker, dampens the impact of a single noisy fit, and provides a "memory"
+            // so a one-frame dust streak cannot displace the real lane curve.
+            private double  coefSmoothingAlpha       = 0.30;
+
+            // If detection fails, the smoothed coefficients from the previous frame are
+            // re-used for this many frames before being cleared. This bridges short gaps
+            // (one or two frames where the mask was weak) without producing dropouts.
+            private int     maxFramesWithoutDetection = 5;
+
+            // When both bases are detected, the gap between them must be within ±this
+            // fraction of the learned lane width. Roadside dust streaks paired with a real
+            // lane line typically violate this — the gap is far too wide or too narrow.
+            private double  laneWidthToleranceRatio   = 0.30;
+
+            // A fitted polynomial must stay within ±this × bevWidth of the BEV horizontal
+            // bounds across its sample range. Catches wild fits where noise dragged the
+            // curve far off the road.
+            private double  maxCurveExcursionRatio    = 0.40;
+
             // Drawing — BGR. Yellow left, red right.
             private Scalar  leftColor               = new Scalar(0,   255, 255);
             private Scalar  rightColor              = new Scalar(0,   0,   255);
@@ -234,6 +274,11 @@ public final class LaneCurveDetector {
             public Builder minPointsForFit(int v)            { this.minPointsForFit = v; return this; }
             public Builder residualThresholdPx(double v)     { this.residualThresholdPx = v; return this; }
             public Builder refinementIterations(int v)       { this.refinementIterations = v; return this; }
+            public Builder maxFitRmsPx(double v)             { this.maxFitRmsPx = v; return this; }
+            public Builder coefSmoothingAlpha(double v)        { this.coefSmoothingAlpha = v; return this; }
+            public Builder maxFramesWithoutDetection(int v)    { this.maxFramesWithoutDetection = v; return this; }
+            public Builder laneWidthToleranceRatio(double v)   { this.laneWidthToleranceRatio = v; return this; }
+            public Builder maxCurveExcursionRatio(double v)    { this.maxCurveExcursionRatio = v; return this; }
             public Builder leftColor(Scalar v)               { this.leftColor = v; return this; }
             public Builder rightColor(Scalar v)              { this.rightColor = v; return this; }
             public Builder lineThickness(int v)              { this.lineThickness = v; return this; }
@@ -272,6 +317,16 @@ public final class LaneCurveDetector {
                     throw new IllegalArgumentException("residualThresholdPx must be > 0");
                 if (refinementIterations < 0)
                     throw new IllegalArgumentException("refinementIterations must be >= 0");
+                if (maxFitRmsPx <= 0)
+                    throw new IllegalArgumentException("maxFitRmsPx must be > 0");
+                if (coefSmoothingAlpha <= 0 || coefSmoothingAlpha > 1)
+                    throw new IllegalArgumentException("coefSmoothingAlpha must be in (0,1]");
+                if (maxFramesWithoutDetection < 0)
+                    throw new IllegalArgumentException("maxFramesWithoutDetection must be >= 0");
+                if (laneWidthToleranceRatio <= 0 || laneWidthToleranceRatio > 1)
+                    throw new IllegalArgumentException("laneWidthToleranceRatio must be in (0,1]");
+                if (maxCurveExcursionRatio <= 0)
+                    throw new IllegalArgumentException("maxCurveExcursionRatio must be > 0");
                 Objects.requireNonNull(leftColor);
                 Objects.requireNonNull(rightColor);
                 return new Config(this);
@@ -294,6 +349,14 @@ public final class LaneCurveDetector {
     // EMA estimate of lane width in BEV pixels, learned from frames where both lanes were
     // detected. Drives the parallel-lane hypothesis when only one side is found.
     private double  learnedLaneWidthBev = Double.NaN;
+
+    // Temporally-smoothed polynomial coefficients per side and how many frames have passed
+    // since the last fresh detection on that side. After maxFramesWithoutDetection the
+    // smoothed memory is cleared so a stale curve does not hang around forever.
+    private double[] smoothedLeftCoef   = null;
+    private double[] smoothedRightCoef  = null;
+    private int      framesSinceLeftSeen  = Integer.MAX_VALUE / 2;
+    private int      framesSinceRightSeen = Integer.MAX_VALUE / 2;
 
     private boolean released = false;
 
@@ -371,6 +434,24 @@ public final class LaneCurveDetector {
             int leftBaseX  = bases[0];
             int rightBaseX = bases[1];
 
+            // Heuristic 1: lane-width sanity on the base pair. If both bases are present
+            // and we already know the lane width, a pair whose gap is far from the learned
+            // value almost always contains one impostor (typically a dust streak / kerb
+            // edge along the road shoulder). Drop the impostor — the side whose distance
+            // from BEV centre is further than what the learned half-width predicts.
+            if (leftBaseX >= 0 && rightBaseX >= 0 && !Double.isNaN(learnedLaneWidthBev)) {
+                double gap = rightBaseX - leftBaseX;
+                double tol = learnedLaneWidthBev * config.laneWidthToleranceRatio;
+                if (Math.abs(gap - learnedLaneWidthBev) > tol) {
+                    double mid = config.bevWidth * 0.5;
+                    double expectedHalf = learnedLaneWidthBev * 0.5;
+                    double leftErr  = Math.abs((mid - leftBaseX)  - expectedHalf);
+                    double rightErr = Math.abs((rightBaseX - mid) - expectedHalf);
+                    if (leftErr > rightErr) leftBaseX  = -1;
+                    else                    rightBaseX = -1;
+                }
+            }
+
             List<Point> leftPixels  = (leftBaseX  >= 0)
                     ? slidingWindowSearch(bev, leftBaseX)  : new ArrayList<>();
             List<Point> rightPixels = (rightBaseX >= 0)
@@ -378,6 +459,17 @@ public final class LaneCurveDetector {
 
             double[] leftCoef  = robustFit(leftPixels);
             double[] rightCoef = robustFit(rightPixels);
+
+            // Heuristic 2: curvature sanity. Reject polynomials that put the curve far
+            // outside BEV bounds — these come from noise dragging the fit off the road.
+            if (leftCoef  != null && !curveStaysInBounds(leftCoef))  leftCoef  = null;
+            if (rightCoef != null && !curveStaysInBounds(rightCoef)) rightCoef = null;
+
+            // Heuristic 3: temporal smoothing. Blend the fresh fit with the previous
+            // frame's smoothed version, or — if this frame failed but the previous was
+            // recent and good — fall back to the smoothed memory.
+            leftCoef  = smoothLeft(leftCoef);
+            rightCoef = smoothRight(rightCoef);
 
             // Learn lane width from frames where both lanes are detected — used as a
             // hypothesis seed on frames where one side is missing.
@@ -423,9 +515,13 @@ public final class LaneCurveDetector {
     }
 
     public void reset() {
-        lastWidth           = -1;
-        lastHeight          = -1;
-        learnedLaneWidthBev = Double.NaN;
+        lastWidth            = -1;
+        lastHeight           = -1;
+        learnedLaneWidthBev  = Double.NaN;
+        smoothedLeftCoef     = null;
+        smoothedRightCoef    = null;
+        framesSinceLeftSeen  = Integer.MAX_VALUE / 2;
+        framesSinceRightSeen = Integer.MAX_VALUE / 2;
         releaseCachedGeometry();
     }
 
@@ -821,6 +917,85 @@ public final class LaneCurveDetector {
         return (double) hits / total >= config.hypothesisMinSupportFraction;
     }
 
+    /**
+     * Sample {@code coef} at five evenly-spaced y values across the BEV and check that none
+     * of them excurses more than {@code maxCurveExcursionRatio × bevWidth} past the left
+     * or right edge of BEV. Random-noise fits often produce a polynomial whose curve flies
+     * far out of the road; this test catches them without rejecting legitimate sharp
+     * curves whose endpoints are still near the BEV edges.
+     */
+    private boolean curveStaysInBounds(double[] coef) {
+        double margin = config.bevWidth * config.maxCurveExcursionRatio;
+        double lo = -margin;
+        double hi = config.bevWidth + margin;
+        int yMax = config.bevHeight - 1;
+        for (int i = 0; i <= 4; i++) {
+            double y = yMax * (i / 4.0);
+            double x = evalPoly(coef, y);
+            if (x < lo || x > hi) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Update {@link #smoothedLeftCoef} from this frame's fresh fit {@code freshCoef} and
+     * return the value that should be used downstream. Three branches:
+     * <ul>
+     *   <li>Fresh fit present, no memory → seed memory with the fresh fit and return it.</li>
+     *   <li>Fresh fit present AND memory present → blend with EMA, return the blend.</li>
+     *   <li>Fresh fit missing but memory is still recent → reuse memory, return it.</li>
+     *   <li>Fresh fit missing AND memory stale → clear memory, return null.</li>
+     * </ul>
+     */
+    private double[] smoothLeft(double[] freshCoef) {
+        if (freshCoef != null) {
+            if (smoothedLeftCoef == null
+                    || framesSinceLeftSeen > config.maxFramesWithoutDetection
+                    || smoothedLeftCoef.length != freshCoef.length) {
+                smoothedLeftCoef = freshCoef.clone();
+            } else {
+                smoothedLeftCoef = blendCoefs(smoothedLeftCoef, freshCoef, config.coefSmoothingAlpha);
+            }
+            framesSinceLeftSeen = 0;
+            return smoothedLeftCoef.clone();
+        }
+        framesSinceLeftSeen++;
+        if (smoothedLeftCoef != null && framesSinceLeftSeen <= config.maxFramesWithoutDetection) {
+            return smoothedLeftCoef.clone();
+        }
+        smoothedLeftCoef = null;
+        return null;
+    }
+
+    private double[] smoothRight(double[] freshCoef) {
+        if (freshCoef != null) {
+            if (smoothedRightCoef == null
+                    || framesSinceRightSeen > config.maxFramesWithoutDetection
+                    || smoothedRightCoef.length != freshCoef.length) {
+                smoothedRightCoef = freshCoef.clone();
+            } else {
+                smoothedRightCoef = blendCoefs(smoothedRightCoef, freshCoef, config.coefSmoothingAlpha);
+            }
+            framesSinceRightSeen = 0;
+            return smoothedRightCoef.clone();
+        }
+        framesSinceRightSeen++;
+        if (smoothedRightCoef != null && framesSinceRightSeen <= config.maxFramesWithoutDetection) {
+            return smoothedRightCoef.clone();
+        }
+        smoothedRightCoef = null;
+        return null;
+    }
+
+    /** EMA blend: result = (1−α)·prev + α·fresh, applied per coefficient. */
+    private static double[] blendCoefs(double[] prev, double[] fresh, double alpha) {
+        double[] out = new double[prev.length];
+        for (int i = 0; i < prev.length; i++) {
+            out[i] = (1.0 - alpha) * prev[i] + alpha * fresh[i];
+        }
+        return out;
+    }
+
     /** Parallel-shift a polynomial along x: add {@code offsetX} to its constant term. */
     private static double[] shiftPolynomial(double[] coef, double offsetX) {
         double[] shifted = coef.clone();
@@ -955,6 +1130,22 @@ public final class LaneCurveDetector {
             points.clear();
             points.addAll(inliers);
         }
+
+        // Fit-quality gate: RMS of the inliers' horizontal residual to the polynomial.
+        //   - A genuine 1-D lane curve: pixels hug the polynomial → RMS = 2-5 px.
+        //   - A 2-D crack-cluster / dust patch / paint blotch: pixels scattered in
+        //     a region → RMS = 15-30 px even though the polynomial is the best fit.
+        // The robustFit converges in both cases (it's a least-squares fit), but only the
+        // first one has the curve actually describing the data. RMS is the principled way
+        // to tell them apart — independent of pixel count, lane width, or noise type.
+        double sumSq = 0.0;
+        for (Point p : points) {
+            double d = p.x - evalPoly(coef, p.y);
+            sumSq += d * d;
+        }
+        double rms = Math.sqrt(sumSq / Math.max(1, points.size()));
+        if (rms > config.maxFitRmsPx) return null;
+
         return coef;
     }
 

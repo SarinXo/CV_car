@@ -1,5 +1,6 @@
 package sarinxo.edu.cvproject.detection;
 
+import lombok.extern.slf4j.Slf4j;
 import org.opencv.core.Core;
 import org.opencv.core.CvType;
 import org.opencv.core.Mat;
@@ -73,6 +74,7 @@ import java.util.Objects;
  * Call {@link #reset()} between unrelated videos. Call {@link #release()} when finished.
  * Instances are <b>not</b> thread-safe.
  */
+@Slf4j
 public final class LaneMarkingMaskExtractor {
 
     /** How colour evidence and structural evidence are combined. */
@@ -105,6 +107,13 @@ public final class LaneMarkingMaskExtractor {
         public final int hlsSMax;
         public final int grayWhiteMin;
 
+        // -- Perceptual whiteness (LAB chromatic distance from the gray axis) --
+        // Catches off-white tones — beige, cream, weathered paint, light gray — that the
+        // human eye still reads as "white", but which fall through the HLS / grayscale
+        // thresholds because they have either a slight chromatic tint or moderate brightness.
+        public final int perceptualWhiteLMin;          // L (0..255 in OpenCV LAB) lower bound
+        public final int perceptualWhiteChromaThresh; // max of |a − 128| and |b − 128| around gray axis
+
         // -- Top-Hat structural cue --
         public final Size topHatKernelSize;
         public final int  topHatThreshold;
@@ -119,6 +128,14 @@ public final class LaneMarkingMaskExtractor {
 
         // -- Connected-component filtering --
         public final double minComponentAreaRatio;
+
+        // -- Spatial band clip — final step. Anything outside the [top..bottom] Y band of
+        //    the frame is set to 0. Removes sky / foliage above the horizon and dashboard /
+        //    timestamp / hood reflections below the visible road. Defaults are tuned to a
+        //    typical front-facing dashcam — adjust for unusual mount geometry.
+        public final double roiTopClipRatio;       // y < this × H is set to 0
+        public final double roiBottomClipRatio;    // y >= this × H is set to 0
+
 
         // -- Skeletonization --
         public final boolean skeletonize;
@@ -138,6 +155,8 @@ public final class LaneMarkingMaskExtractor {
             this.hlsLMin               = b.hlsLMin;
             this.hlsSMax               = b.hlsSMax;
             this.grayWhiteMin          = b.grayWhiteMin;
+            this.perceptualWhiteLMin   = b.perceptualWhiteLMin;
+            this.perceptualWhiteChromaThresh = b.perceptualWhiteChromaThresh;
             this.topHatKernelSize      = b.topHatKernelSize;
             this.topHatThreshold       = b.topHatThreshold;
             this.fusionMode            = b.fusionMode;
@@ -145,6 +164,8 @@ public final class LaneMarkingMaskExtractor {
             this.closingEnabled        = b.closingEnabled;
             this.closingKernelSize     = b.closingKernelSize;
             this.minComponentAreaRatio = b.minComponentAreaRatio;
+            this.roiTopClipRatio       = b.roiTopClipRatio;
+            this.roiBottomClipRatio    = b.roiBottomClipRatio;
             this.skeletonize           = b.skeletonize;
             this.skeletonMaxIterations = b.skeletonMaxIterations;
             this.temporalWindowSize    = b.temporalWindowSize;
@@ -156,8 +177,11 @@ public final class LaneMarkingMaskExtractor {
 
         /** Mutable builder for {@link Config}. */
         public static final class Builder {
-            // Preprocessing
-            private int    gaussianKernelSize     = 5;
+            // Preprocessing — 3×3 Gaussian: enough to suppress sensor noise without softening
+            // the lane edges. Larger kernels (5×5+) bleed the bright line outward and the
+            // colour thresholds then catch the bleed, producing a mask noticeably wider
+            // than the actual paint.
+            private int    gaussianKernelSize     = 3;
             private double claheClipLimit         = 2.0;
             private Size   claheTileGridSize      = new Size(8, 8);
 
@@ -171,10 +195,20 @@ public final class LaneMarkingMaskExtractor {
             private int    hlsSMax                = 60;
             private int    grayWhiteMin           = 195;
 
+            // Perceptual whiteness: catches beige, cream, weathered paint, light gray.
+            // L > 150 ≈ "noticeably brighter than asphalt"; chroma ≤ 15 ≈ "essentially on
+            // the gray axis, only a faint warm/cool tint". Lane paint that aged to a
+            // wheat-ish tone (RGB around 205, 192, 168) gives LAB |a−128|≈4, |b−128|≈12,
+            // L≈186 — comfortably passes this filter while pure yellow chroma (b ≥ 160)
+            // is far outside it.
+            private int    perceptualWhiteLMin    = 150;
+            private int    perceptualWhiteChromaThresh = 15;
+
             // Top-Hat — kernel sized to cover a typical paint width on dashcam footage;
             // threshold lowered so weaker local peaks (faded paint) still register.
             private Size   topHatKernelSize       = new Size(15, 15);
             private int    topHatThreshold        = 25;
+
 
             // Fusion — STRICT (AND) gives precise pixel-accurate output.
             private FusionMode fusionMode         = FusionMode.STRICT;
@@ -185,6 +219,19 @@ public final class LaneMarkingMaskExtractor {
             private Size    closingKernelSize     = new Size(3, 5);
 
             private double  minComponentAreaRatio = 0.00003;          // ~0.003 % of frame area
+
+            // Spatial Y-band — final, cheap noise filter. 0.50 cuts everything above
+            // mid-frame (sky, foliage, signs, traffic-light gantries); 0.92 cuts the very
+            // bottom (dashboard, hood reflections, in-video timestamp / watermark). Lane
+            // paint on a typical dashcam mount lives comfortably inside this band.
+            //
+            // Tune cases:
+            //  - Camera pointed steeply down → raise roiTopClipRatio to 0.35.
+            //  - Camera mounted very low / no hood visible → raise roiBottomClipRatio to 0.99.
+            //  - Disable entirely: set top=0.0 and bottom=1.0.
+            private double  roiTopClipRatio       = 0.50;
+            private double  roiBottomClipRatio    = 0.92;
+
 
             // Skeletonization — off by default; turn on for pixel-thin centerlines.
             private boolean skeletonize           = false;
@@ -203,6 +250,8 @@ public final class LaneMarkingMaskExtractor {
             public Builder hlsLMin(int v)                    { this.hlsLMin = v; return this; }
             public Builder hlsSMax(int v)                    { this.hlsSMax = v; return this; }
             public Builder grayWhiteMin(int v)               { this.grayWhiteMin = v; return this; }
+            public Builder perceptualWhiteLMin(int v)        { this.perceptualWhiteLMin = v; return this; }
+            public Builder perceptualWhiteChromaThresh(int v){ this.perceptualWhiteChromaThresh = v; return this; }
             public Builder topHatKernelSize(Size v)          { this.topHatKernelSize = v; return this; }
             public Builder topHatThreshold(int v)            { this.topHatThreshold = v; return this; }
             public Builder fusionMode(FusionMode v)          { this.fusionMode = v; return this; }
@@ -210,6 +259,8 @@ public final class LaneMarkingMaskExtractor {
             public Builder closingEnabled(boolean v)         { this.closingEnabled = v; return this; }
             public Builder closingKernelSize(Size v)         { this.closingKernelSize = v; return this; }
             public Builder minComponentAreaRatio(double v)   { this.minComponentAreaRatio = v; return this; }
+            public Builder roiTopClipRatio(double v)         { this.roiTopClipRatio = v; return this; }
+            public Builder roiBottomClipRatio(double v)      { this.roiBottomClipRatio = v; return this; }
             public Builder skeletonize(boolean v)            { this.skeletonize = v; return this; }
             public Builder skeletonMaxIterations(int v)      { this.skeletonMaxIterations = v; return this; }
             public Builder temporalWindowSize(int v)         { this.temporalWindowSize = v; return this; }
@@ -226,6 +277,12 @@ public final class LaneMarkingMaskExtractor {
                     throw new IllegalArgumentException("temporalMinAgreement must be in [1, temporalWindowSize]");
                 if (minComponentAreaRatio < 0)
                     throw new IllegalArgumentException("minComponentAreaRatio must be >= 0");
+                if (roiTopClipRatio < 0 || roiTopClipRatio > 1)
+                    throw new IllegalArgumentException("roiTopClipRatio must be in [0, 1]");
+                if (roiBottomClipRatio < 0 || roiBottomClipRatio > 1)
+                    throw new IllegalArgumentException("roiBottomClipRatio must be in [0, 1]");
+                if (roiTopClipRatio >= roiBottomClipRatio)
+                    throw new IllegalArgumentException("roiTopClipRatio must be < roiBottomClipRatio");
                 if (skeletonMaxIterations < 1)
                     throw new IllegalArgumentException("skeletonMaxIterations must be >= 1");
                 Objects.requireNonNull(fusionMode, "fusionMode");
@@ -304,6 +361,13 @@ public final class LaneMarkingMaskExtractor {
         Mat yellowMask    = new Mat();
         Mat whiteMaskHls  = new Mat();
         Mat whiteMaskGray = new Mat();
+        Mat aDelta        = new Mat();
+        Mat bDelta        = new Mat();
+        Mat aLowChroma    = new Mat();
+        Mat bLowChroma    = new Mat();
+        Mat lowChroma     = new Mat();
+        Mat lBright       = new Mat();
+        Mat perceptualWh  = new Mat();
         Mat whiteMask     = new Mat();
         Mat colorMask     = new Mat();
         Mat topHat        = new Mat();
@@ -324,6 +388,7 @@ public final class LaneMarkingMaskExtractor {
             Imgproc.cvtColor(blurred, lab, Imgproc.COLOR_BGR2Lab);
             Core.split(lab, labChannels);
             Mat lChannel = labChannels.get(0);
+            Mat aChannel = labChannels.get(1);
             Mat bChannel = labChannels.get(2);
             clahe.apply(lChannel, lChannel);
             Core.merge(labChannels, lab);
@@ -342,9 +407,29 @@ public final class LaneMarkingMaskExtractor {
                     whiteMaskHls);
             Imgproc.cvtColor(enhanced, gray, Imgproc.COLOR_BGR2GRAY);
             Imgproc.threshold(gray, whiteMaskGray, config.grayWhiteMin, 255, Imgproc.THRESH_BINARY);
-            Core.bitwise_or(whiteMaskHls, whiteMaskGray, whiteMask);
 
-            // -- 3c. Colour evidence = yellow ∪ white ------------------------------------------
+            // -- 3c. Perceptual whiteness: bright AND close to LAB gray axis -------------------
+            // In OpenCV LAB the gray axis is at (a, b) = (128, 128). Beige / cream / weathered
+            // paint sits within a small box around it (|a−128| ≤ T and |b−128| ≤ T) while
+            // genuine yellow or coloured surfaces sit far from it. Pair the chromaticity test
+            // with a brightness gate so this only fires on light-on-asphalt pixels, not on
+            // a dark neutral gray (e.g. asphalt itself, |a−128|≈0, |b−128|≈0).
+            Core.absdiff(aChannel, new Scalar(128), aDelta);
+            Core.absdiff(bChannel, new Scalar(128), bDelta);
+            Imgproc.threshold(aDelta, aLowChroma,
+                    config.perceptualWhiteChromaThresh, 255, Imgproc.THRESH_BINARY_INV);
+            Imgproc.threshold(bDelta, bLowChroma,
+                    config.perceptualWhiteChromaThresh, 255, Imgproc.THRESH_BINARY_INV);
+            Core.bitwise_and(aLowChroma, bLowChroma, lowChroma);
+            Imgproc.threshold(lChannel, lBright,
+                    config.perceptualWhiteLMin, 255, Imgproc.THRESH_BINARY);
+            Core.bitwise_and(lBright, lowChroma, perceptualWh);
+
+            // -- 3d. Aggregate white evidence: HLS ∪ grayscale ∪ perceptual --------------------
+            Core.bitwise_or(whiteMaskHls, whiteMaskGray, whiteMask);
+            Core.bitwise_or(whiteMask,    perceptualWh,  whiteMask);
+
+            // -- 3e. Colour evidence = yellow ∪ white ------------------------------------------
             Core.bitwise_or(yellowMask, whiteMask, colorMask);
 
             // -- 4. Structural evidence: Top-Hat → threshold -----------------------------------
@@ -386,9 +471,19 @@ public final class LaneMarkingMaskExtractor {
             }
 
             // -- 9. Temporal agreement ---------------------------------------------------------
-            return applyTemporalSmoothing(forTemporal);
+            Mat smoothed = applyTemporalSmoothing(forTemporal);
 
-        } finally {
+            // -- 10. Spatial Y-band clip — zero out above-horizon and below-road regions.
+            // This is the cheapest possible noise filter for a fixed dashcam mount: anything
+            // outside [roiTopClipRatio × H, roiBottomClipRatio × H] cannot be lane paint
+            // (sky, foliage, traffic signs above the road; dashboard, hood, watermark below).
+            applyBandClip(smoothed);
+            return smoothed;
+
+        } catch (Exception e) {
+            log.error("Ошибка генерации маски", e);
+            throw new RuntimeException(e);
+        }finally {
             blurred.release();
             lab.release();
             enhanced.release();
@@ -399,6 +494,13 @@ public final class LaneMarkingMaskExtractor {
             yellowMask.release();
             whiteMaskHls.release();
             whiteMaskGray.release();
+            aDelta.release();
+            bDelta.release();
+            aLowChroma.release();
+            bLowChroma.release();
+            lowChroma.release();
+            lBright.release();
+            perceptualWh.release();
             whiteMask.release();
             colorMask.release();
             topHat.release();
@@ -433,6 +535,27 @@ public final class LaneMarkingMaskExtractor {
     // =========================================================================================
     // Helpers
     // =========================================================================================
+
+    /**
+     * Zero out two horizontal bands of the mask in-place: rows above
+     * {@code roiTopClipRatio × height} and rows at or below {@code roiBottomClipRatio ×
+     * height}. Used as a final spatial filter — the bands lie outside the physically
+     * possible Y-range of road paint on a forward-facing dashcam.
+     */
+    private void applyBandClip(Mat mask) {
+        int h = mask.rows();
+        int w = mask.cols();
+        int topClip = (int) Math.round(h * config.roiTopClipRatio);
+        int botClip = (int) Math.round(h * config.roiBottomClipRatio);
+        if (topClip > 0) {
+            Mat topBand = mask.submat(0, Math.min(topClip, h), 0, w);
+            try { topBand.setTo(new Scalar(0)); } finally { topBand.release(); }
+        }
+        if (botClip < h) {
+            Mat botBand = mask.submat(Math.max(0, botClip), h, 0, w);
+            try { botBand.setTo(new Scalar(0)); } finally { botBand.release(); }
+        }
+    }
 
     /** Drop connected components whose area is below {@code minComponentAreaRatio × totalArea}. */
     private Mat removeSmallComponents(Mat binary, int totalArea) {

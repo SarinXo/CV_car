@@ -266,28 +266,47 @@ public class DualVideoPlayer {
         view1.setMediaPlayer(player1);
         bindPlayer(player1);
 
-        new Thread(() -> startProcessing(file)).start();
+        new Thread(() -> {
+            try {
+                startProcessing(file);
+            } catch (Throwable t) {
+                System.err.println("[startProcessing] Failed: " + t);
+                t.printStackTrace();
+                Platform.runLater(() -> setControlsDisabled(false));
+            }
+        }).start();
     }
 
     private void startProcessing(File file) {
         VideoCapture capture = new VideoCapture(file.getAbsolutePath());
-        if (!capture.isOpened()) return;
+        if (!capture.isOpened()) {
+            System.err.println("[startProcessing] VideoCapture failed to open: " + file);
+            return;
+        }
 
         Mat frame = new Mat();
         List<Image> processedFrames = new ArrayList<>();
         List<Image> maskFrames = new ArrayList<>();
         LaneMarkingMaskExtractor maskExtractor = new LaneMarkingMaskExtractor();
         LaneCurveDetector detector = new LaneCurveDetector();
+        int frameIdx = 0;
         while (capture.read(frame)) {
             if (frame.empty()) continue;
-            Mat mask = maskExtractor.process(frame);//тута
-            Image maskImage = matToImage(mask);
-            Mat processed = detector.process(frame, mask);//здеся
-            Image fxImage = matToImage(processed);
-            processedFrames.add(fxImage);
-            maskFrames.add(maskImage);
-            mask.release();
-            processed.release();
+            try {
+                Mat mask = maskExtractor.process(frame);//тута
+                Image maskImage = matToImage(mask);
+                Mat processed = detector.process(frame, mask);//здеся
+                Image fxImage = matToImage(processed);
+                processedFrames.add(fxImage);
+                maskFrames.add(maskImage);
+                mask.release();
+                processed.release();
+            } catch (Throwable t) {
+                System.err.println("[startProcessing] Frame " + frameIdx + " threw: " + t);
+                t.printStackTrace();
+                throw t;
+            }
+            frameIdx++;
         }
 
         capture.release();
