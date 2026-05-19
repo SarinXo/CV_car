@@ -443,8 +443,17 @@ public final class LaneCurveDetector {
         Mat roiMask = applyRoi(mask);
         Mat bev     = new Mat();
         try {
-            Imgproc.warpPerspective(roiMask, bev, origToBevMatrix,
-                    new Size(config.bevWidth, config.bevHeight), Imgproc.INTER_NEAREST);
+            Imgproc.warpPerspective(
+                    roiMask,
+                    bev,
+                    origToBevMatrix,
+                    new Size(config.bevWidth, config.bevHeight),
+                    Imgproc.INTER_NEAREST
+            );
+
+            Mat filtered = keepOnlyThickLines(bev);
+            bev.release();
+            bev = filtered;
 
             int[] bases = findBases(bev);
             int leftBaseX  = bases[0];
@@ -555,6 +564,42 @@ public final class LaneCurveDetector {
         } finally {
             bev.release();
             roiMask.release();
+        }
+    }
+    private Mat keepOnlyThickLines(Mat binary) {
+        Mat dist = new Mat();
+        Mat normalized = new Mat();
+        Mat thickMask = new Mat();
+
+        try {
+            // distance transform требует white foreground
+            Imgproc.distanceTransform(binary, dist, Imgproc.DIST_L2, 5);
+
+            // оставить только достаточно толстые области
+            Imgproc.threshold(
+                    dist,
+                    thickMask,
+                    1.5, // минимальная "полутолщина"
+                    255.0,
+                    Imgproc.THRESH_BINARY
+            );
+
+            thickMask.convertTo(thickMask, CvType.CV_8U);
+
+            // немного расширить обратно
+            Imgproc.dilate(
+                    thickMask,
+                    thickMask,
+                    Imgproc.getStructuringElement(
+                            Imgproc.MORPH_ELLIPSE,
+                            new Size(5, 5)
+                    )
+            );
+
+            return thickMask;
+        } finally {
+            dist.release();
+            normalized.release();
         }
     }
 

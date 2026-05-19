@@ -241,7 +241,7 @@ public final class LaneMarkingMaskExtractor {
             //  - Camera mounted very low / no hood visible → raise roiBottomClipRatio to 0.99.
             //  - Disable entirely: set top=0.0 and bottom=1.0.
             private double  roiTopClipRatio       = 0.50;
-            private double  roiBottomClipRatio    = 0.92;
+            private double  roiBottomClipRatio    = 0.85;
 
 
             // Skeletonization — off by default; turn on for pixel-thin centerlines.
