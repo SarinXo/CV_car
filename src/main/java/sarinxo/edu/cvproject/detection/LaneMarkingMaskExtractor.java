@@ -4,6 +4,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.opencv.core.Core;
 import org.opencv.core.CvType;
 import org.opencv.core.Mat;
+import org.opencv.core.MatOfFloat;
+import org.opencv.core.MatOfInt;
 import org.opencv.core.Scalar;
 import org.opencv.core.Size;
 import org.opencv.imgproc.CLAHE;
@@ -11,6 +13,7 @@ import org.opencv.imgproc.Imgproc;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
@@ -145,6 +148,10 @@ public final class LaneMarkingMaskExtractor {
         public final int temporalWindowSize;
         public final int temporalMinAgreement;
 
+        public final boolean useGradientFilter;
+        public final boolean useDynamicThreshold;
+        public final double gradientThreshold;
+
         private Config(Builder b) {
             this.gaussianKernelSize    = b.gaussianKernelSize;
             this.claheClipLimit        = b.claheClipLimit;
@@ -170,6 +177,10 @@ public final class LaneMarkingMaskExtractor {
             this.skeletonMaxIterations = b.skeletonMaxIterations;
             this.temporalWindowSize    = b.temporalWindowSize;
             this.temporalMinAgreement  = b.temporalMinAgreement;
+
+            this.useGradientFilter = b.useGradientFilter;
+            this.useDynamicThreshold = b.useDynamicThreshold;
+            this.gradientThreshold = b.gradientThreshold;
         }
 
         public static Config  defaults() { return new Builder().build(); }
@@ -237,6 +248,10 @@ public final class LaneMarkingMaskExtractor {
             private boolean skeletonize           = false;
             private int     skeletonMaxIterations = 100;
 
+            private boolean useGradientFilter = true;
+            private boolean useDynamicThreshold = true;
+            private double gradientThreshold = 30.0;
+
             // Temporal — agreement of 2 out of 3 frames kills single-frame flicker.
             private int     temporalWindowSize    = 3;
             private int     temporalMinAgreement  = 2;
@@ -265,6 +280,10 @@ public final class LaneMarkingMaskExtractor {
             public Builder skeletonMaxIterations(int v)      { this.skeletonMaxIterations = v; return this; }
             public Builder temporalWindowSize(int v)         { this.temporalWindowSize = v; return this; }
             public Builder temporalMinAgreement(int v)       { this.temporalMinAgreement = v; return this; }
+
+            public Builder useGradientFilter(boolean v) { this.useGradientFilter = v; return this; }
+            public Builder useDynamicThreshold(boolean v) { this.useDynamicThreshold = v; return this; }
+            public Builder gradientThreshold(double v) { this.gradientThreshold = v; return this; }
 
             public Config build() {
                 if (gaussianKernelSize < 1 || gaussianKernelSize % 2 == 0)
@@ -379,6 +398,13 @@ public final class LaneMarkingMaskExtractor {
         Mat afterSkeleton = null;
         List<Mat> labChannels = new ArrayList<>(3);
 
+        Mat roiL = new Mat();
+        Mat histMat = new Mat();
+        Mat gradX = new Mat();
+        Mat gradY = new Mat();
+        Mat gradMag = new Mat();
+        Mat gradientMask = new Mat();
+
         try {
             // -- 1. Denoise --------------------------------------------------------------------
             int k = config.gaussianKernelSize;
@@ -393,6 +419,42 @@ public final class LaneMarkingMaskExtractor {
             clahe.apply(lChannel, lChannel);
             Core.merge(labChannels, lab);
             Imgproc.cvtColor(lab, enhanced, Imgproc.COLOR_Lab2BGR);
+
+            int currentGrayWhiteMin = config.grayWhiteMin;
+            if (config.useDynamicThreshold) {
+                int h = frame.rows();
+                int w = frame.cols();
+                int top = (int) (h * config.roiTopClipRatio);
+                int bot = (int) (h * config.roiBottomClipRatio);
+
+                // Define ROI in the road area to estimate asphalt brightness
+                roiL = lChannel.submat(top, bot, 0, w);
+
+                // Calculate Histogram
+                Imgproc.calcHist(
+                        Collections.singletonList(roiL), // images
+                        new MatOfInt(0),                 // channels
+                        new Mat(),                       // mask
+                        histMat,                         // hist
+                        new MatOfInt(256),               // histSize
+                        new MatOfFloat(0f, 256f)         // ranges
+                );
+
+                // Find Median Brightness
+                double totalPixels = roiL.rows() * roiL.cols();
+                double cumulativeSum = 0;
+                int median = 0;
+                for (int i = 0; i < 256; i++) {
+                    cumulativeSum += histMat.get(i, 0)[0];
+                    if (cumulativeSum >= totalPixels / 2.0) {
+                        median = i;
+                        break;
+                    }
+                }
+                // Adjust threshold: the white mask must be brighter than the asphalt median
+                currentGrayWhiteMin = Math.max(config.grayWhiteMin, (int)(median + 20));
+                roiL.release();
+            }
 
             // -- 3a. Yellow: high B + L not too dark -------------------------------------------
             Core.inRange(bChannel, new Scalar(config.labBMin), new Scalar(config.labBMax), bMask);
@@ -446,6 +508,23 @@ public final class LaneMarkingMaskExtractor {
             } else {
                 // Either signal is enough. Higher recall on faded paint, more false positives.
                 Core.bitwise_or(colorMask, topHatMask, fused);
+            }
+
+            // градиентный фильтр
+            if (config.useGradientFilter) {
+                // Compute Sobel derivatives on the enhanced L channel
+                Imgproc.Sobel(lChannel, gradX, CvType.CV_32F, 1, 0, 3);
+                Imgproc.Sobel(lChannel, gradY, CvType.CV_32F, 0, 1, 3);
+
+                // Gradient Magnitude = sqrt(dx^2 + dy^2)
+                Core.magnitude(gradX, gradY, gradMag);
+
+                // Convert to 8U and threshold
+                gradMag.convertTo(gradMag, CvType.CV_8U);
+                Imgproc.threshold(gradMag, gradientMask, config.gradientThreshold, 255, Imgproc.THRESH_BINARY);
+
+                // Intersection: keep only pixels that are both "lane-like" AND have a sharp edge
+                Core.bitwise_and(fused, gradientMask, fused);
             }
 
             // -- 6. Light cleanup --------------------------------------------------------------
@@ -508,6 +587,14 @@ public final class LaneMarkingMaskExtractor {
             fused.release();
             opened.release();
             cleaned.release();
+
+            roiL.release();
+            histMat.release();
+            gradX.release();
+            gradY.release();
+            gradMag.release();
+            gradientMask.release();
+
             if (areaFiltered  != null) areaFiltered.release();
             if (afterSkeleton != null) afterSkeleton.release();
             for (Mat ch : labChannels) ch.release();
@@ -656,4 +743,6 @@ public final class LaneMarkingMaskExtractor {
             if (m != null) m.release();
         }
     }
+
+
 }
