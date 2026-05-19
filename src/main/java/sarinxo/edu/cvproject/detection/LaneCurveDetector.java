@@ -39,6 +39,22 @@ import java.util.Objects;
  */
 public final class LaneCurveDetector {
 
+    private static final class LaneFit {
+        final double[] coef;
+        final double rms;
+        final int points;
+        final double confidence;
+
+        LaneFit(double[] coef,
+                double rms,
+                int points,
+                double confidence) {
+            this.coef = coef;
+            this.rms = rms;
+            this.points = points;
+            this.confidence = confidence;
+        }
+    }
     // =========================================================================================
     // Configuration
     // =========================================================================================
@@ -207,7 +223,7 @@ public final class LaneCurveDetector {
             // Cubic polynomial — captures S-curves and roundabouts; quadratic is too rigid
             // to trace strong curvature faithfully. minPointsForFit is the minimum sample
             // size to attempt the fit; it must exceed polynomialDegree.
-            private int     polynomialDegree        = 3;
+            private int     polynomialDegree        = 2;
             private int     minPointsForFit         = 15;
 
             // RANSAC-style outlier rejection. After the initial fit, pixels whose horizontal
@@ -457,8 +473,36 @@ public final class LaneCurveDetector {
             List<Point> rightPixels = (rightBaseX >= 0)
                     ? slidingWindowSearch(bev, rightBaseX) : new ArrayList<>();
 
-            double[] leftCoef  = robustFit(leftPixels);
-            double[] rightCoef = robustFit(rightPixels);
+            LaneFit leftFit = robustFit(leftPixels, smoothedLeftCoef);
+
+            LaneFit rightFit = robustFit(rightPixels, smoothedRightCoef);
+
+            double[] leftCoef = leftFit != null
+                            ? leftFit.coef
+                            : null;
+
+            double[] rightCoef = rightFit != null
+                            ? rightFit.coef
+                            : null;
+
+            if (leftFit != null && rightFit != null) {
+                LaneFit dominant = leftFit.confidence >= rightFit.confidence
+                                ? leftFit
+                                : rightFit;
+                boolean leftDominant = dominant == leftFit;
+                if (leftDominant) {
+                    rightCoef = constrainUsingOtherLane(rightCoef, leftCoef, false);
+                } else {
+                    leftCoef = constrainUsingOtherLane(leftCoef, rightCoef, true);
+                }
+                if (!validatePair(leftCoef, rightCoef)) {
+                    if (leftFit.confidence > rightFit.confidence * 1.5) {
+                        rightCoef = shiftPolynomial(leftCoef, learnedLaneWidthBev);
+                    } else if (rightFit.confidence > leftFit.confidence * 1.5) {
+                        leftCoef = shiftPolynomial(rightCoef, -learnedLaneWidthBev);
+                    }
+                }
+            }
 
             // Heuristic 2: curvature sanity. Reject polynomials that put the curve far
             // outside BEV bounds — these come from noise dragging the fit off the road.
@@ -1110,43 +1154,154 @@ public final class LaneCurveDetector {
      * used for the final fit. This keeps drawing consistent with the fit (the drawn curve
      * spans the inlier y-range).
      */
-    private double[] robustFit(List<Point> points) {
-        if (points.size() < config.minPointsForFit) return null;
-        double[] coef = fitPolynomial(points, config.polynomialDegree);
-        if (coef == null) return null;
+    private LaneFit robustFit(List<Point> points,
+                              double[] previousCoef) {
+
+        if (points.size() < config.minPointsForFit)
+            return null;
+
+        double[] coef =
+                fitPolynomial(points, config.polynomialDegree);
+
+        if (coef == null)
+            return null;
 
         double threshold = config.residualThresholdPx;
+
         for (int it = 0; it < config.refinementIterations; it++) {
-            List<Point> inliers = new ArrayList<>(points.size());
+
+            List<Point> inliers =
+                    new ArrayList<>(points.size());
+
             for (Point p : points) {
-                if (Math.abs(p.x - evalPoly(coef, p.y)) <= threshold) inliers.add(p);
+
+                double residual =
+                        Math.abs(p.x - evalPoly(coef, p.y));
+
+                if (residual <= threshold)
+                    inliers.add(p);
             }
-            // If outlier rejection ate too much, keep the previous fit — better than nothing.
-            if (inliers.size() < config.minPointsForFit) break;
-            if (inliers.size() == points.size()) break;            // converged
-            double[] refit = fitPolynomial(inliers, config.polynomialDegree);
-            if (refit == null) break;
+
+            if (inliers.size() < config.minPointsForFit)
+                break;
+
+            if (inliers.size() == points.size())
+                break;
+
+            double[] refit =
+                    fitPolynomial(inliers,
+                            config.polynomialDegree);
+
+            if (refit == null)
+                break;
+
             coef = refit;
+
             points.clear();
             points.addAll(inliers);
         }
 
-        // Fit-quality gate: RMS of the inliers' horizontal residual to the polynomial.
-        //   - A genuine 1-D lane curve: pixels hug the polynomial → RMS = 2-5 px.
-        //   - A 2-D crack-cluster / dust patch / paint blotch: pixels scattered in
-        //     a region → RMS = 15-30 px even though the polynomial is the best fit.
-        // The robustFit converges in both cases (it's a least-squares fit), but only the
-        // first one has the curve actually describing the data. RMS is the principled way
-        // to tell them apart — independent of pixel count, lane width, or noise type.
         double sumSq = 0.0;
+
         for (Point p : points) {
             double d = p.x - evalPoly(coef, p.y);
             sumSq += d * d;
         }
-        double rms = Math.sqrt(sumSq / Math.max(1, points.size()));
-        if (rms > config.maxFitRmsPx) return null;
 
-        return coef;
+        double rms =
+                Math.sqrt(sumSq / Math.max(1, points.size()));
+
+        if (rms > config.maxFitRmsPx)
+            return null;
+
+        // --------------------------
+        // CONFIDENCE
+        // --------------------------
+
+        double pointScore =
+                Math.min(1.0, points.size() / 120.0);
+
+        double rmsScore =
+                Math.max(0.0,
+                        1.0 - rms / config.maxFitRmsPx);
+
+        double temporalScore = 1.0;
+
+        if (previousCoef != null &&
+                previousCoef.length == coef.length) {
+
+            double dist = coefDistance(previousCoef, coef);
+
+            temporalScore =
+                    Math.max(0.0,
+                            1.0 - dist / 80.0);
+        }
+
+        double confidence =
+                pointScore *
+                        rmsScore *
+                        temporalScore;
+
+        return new LaneFit(
+                coef,
+                rms,
+                points.size(),
+                confidence
+        );
+    }
+
+    private static double coefDistance(double[] a, double[] b) {
+        double sum = 0.0;
+
+        for (int i = 0; i < a.length; i++) {
+            double d = a[i] - b[i];
+            sum += d * d;
+        }
+
+        return Math.sqrt(sum);
+    }
+
+    private static double derivative(double[] coef, double y) {
+        if (coef.length == 3) {
+            // ay² + by + c
+            return 2.0 * coef[0] * y + coef[1];
+        }
+
+        if (coef.length == 4) {
+            // ay³ + by² + cy + d
+            return 3.0 * coef[0] * y * y
+                    + 2.0 * coef[1] * y
+                    + coef[2];
+        }
+        return 0.0;
+    }
+
+    private boolean validatePair(double[] left, double[] right) {
+        if (left == null || right == null)
+            return true;
+
+        for (int y = 0;
+             y < config.bevHeight;
+             y += 40) {
+
+            double lx = evalPoly(left, y);
+            double rx = evalPoly(right, y);
+            double width = rx - lx;
+
+            if (!Double.isNaN(learnedLaneWidthBev)) {
+                double err = Math.abs(width - learnedLaneWidthBev);
+
+                if (err > 35.0)
+                    return false;
+            }
+
+            double ls = derivative(left, y);
+            double rs = derivative(right, y);
+            if (Math.abs(ls - rs) > 0.12)
+                return false;
+        }
+
+        return true;
     }
 
     private static double[] fitPolynomial(List<Point> points, int degree) {
@@ -1175,6 +1330,47 @@ public final class LaneCurveDetector {
             coef.release();
         }
     }
+
+    private double[] constrainUsingOtherLane(double[] weak, double[] strong, boolean weakIsLeft) {
+
+        if (weak == null || strong == null)
+            return weak;
+
+        if (Double.isNaN(learnedLaneWidthBev))
+            return weak;
+
+        int bad = 0;
+        int total = 0;
+
+        for (int y = 0;
+             y < config.bevHeight;
+             y += 40) {
+
+            double sx = evalPoly(strong, y);
+            double wx = evalPoly(weak, y);
+
+            double expected = weakIsLeft
+                            ? sx - learnedLaneWidthBev
+                            : sx + learnedLaneWidthBev;
+            if (Math.abs(wx - expected) > 35.0)
+                bad++;
+
+            total++;
+        }
+
+        if (bad > total * 0.4) {
+            return shiftPolynomial(
+                    strong,
+                    weakIsLeft
+                            ? -learnedLaneWidthBev
+                            : learnedLaneWidthBev
+            );
+        }
+
+        return weak;
+    }
+
+
 
     /** Horner's method — {@code coef[0]} is the highest-degree term. */
     private static double evalPoly(double[] coef, double y) {

@@ -212,8 +212,8 @@ public final class LaneMarkingMaskExtractor {
             // wheat-ish tone (RGB around 205, 192, 168) gives LAB |a−128|≈4, |b−128|≈12,
             // L≈186 — comfortably passes this filter while pure yellow chroma (b ≥ 160)
             // is far outside it.
-            private int    perceptualWhiteLMin    = 150;
-            private int    perceptualWhiteChromaThresh = 15;
+            private int    perceptualWhiteLMin    = 135;
+            private int    perceptualWhiteChromaThresh = 20;
 
             // Top-Hat — kernel sized to cover a typical paint width on dashcam footage;
             // threshold lowered so weaker local peaks (faded paint) still register.
@@ -536,17 +536,16 @@ public final class LaneMarkingMaskExtractor {
             }
 
             // -- 7. Drop tiny components -------------------------------------------------------
-            areaFiltered = (config.minComponentAreaRatio > 0)
-                    ? removeSmallComponents(cleaned, frame.width() * frame.height())
-                    : cleaned.clone();
+            areaFiltered = removeSmallComponents(cleaned, frame.width() * frame.height());
+            Mat geometryFiltered = removeThinNoise(areaFiltered);
 
             // -- 8. Optional skeletonization for pixel-thin centerlines ------------------------
             Mat forTemporal;
             if (config.skeletonize) {
-                afterSkeleton = skeletonize(areaFiltered, skeletonKernel, config.skeletonMaxIterations);
+                afterSkeleton = skeletonize(geometryFiltered, skeletonKernel, config.skeletonMaxIterations);
                 forTemporal   = afterSkeleton;
             } else {
-                forTemporal   = areaFiltered;
+                forTemporal   = geometryFiltered;
             }
 
             // -- 9. Temporal agreement ---------------------------------------------------------
@@ -598,6 +597,70 @@ public final class LaneMarkingMaskExtractor {
             if (areaFiltered  != null) areaFiltered.release();
             if (afterSkeleton != null) afterSkeleton.release();
             for (Mat ch : labChannels) ch.release();
+        }
+    }
+
+    private Mat removeThinNoise(Mat binary) {
+
+        Mat labels = new Mat();
+        Mat stats = new Mat();
+        Mat centroids = new Mat();
+
+        Mat result = Mat.zeros(binary.size(), CvType.CV_8UC1);
+        Mat tmp = new Mat();
+
+        try {
+
+            int count = Imgproc.connectedComponentsWithStats(
+                    binary,
+                    labels,
+                    stats,
+                    centroids,
+                    8,
+                    CvType.CV_32S
+            );
+
+            for (int label = 1; label < count; label++) {
+
+                int area = (int) stats.get(label, Imgproc.CC_STAT_AREA)[0];
+
+                int width = (int) stats.get(label, Imgproc.CC_STAT_WIDTH)[0];
+                int height = (int) stats.get(label, Imgproc.CC_STAT_HEIGHT)[0];
+
+                int maxDim = Math.max(width, height);
+                int minDim = Math.max(1, Math.min(width, height));
+
+                double aspect = (double) maxDim / minDim;
+
+                // ==========================
+                // FILTERS
+                // ==========================
+
+                // tiny garbage
+                if (area < 20)
+                    continue;
+
+                // ultra-thin line noise
+                if (minDim <= 2 && area < 80)
+                    continue;
+
+                // short thin fragments
+                if (aspect > 12.0 && area < 120)
+                    continue;
+
+                // keep component
+                Core.compare(labels, new Scalar(label), tmp, Core.CMP_EQ);
+                Core.bitwise_or(result, tmp, result);
+            }
+
+            return result;
+
+        } finally {
+
+            labels.release();
+            stats.release();
+            centroids.release();
+            tmp.release();
         }
     }
 
